@@ -1,6 +1,7 @@
 ## Overview
 A viewer/extractor for textures and models from Transformers Cybertron Adventures for the Nintendo Wii.
 
+<img width="1920" height="1040" alt="preview01" src="https://github.com/user-attachments/assets/dc679e5b-ef20-45fb-82bb-730c6f56fe89" />
 
 ## Requirements
 
