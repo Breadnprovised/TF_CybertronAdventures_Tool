@@ -21,4 +21,4 @@ Texture Viewer - `cybertron_tex_gui.py`
 
 
 ## Disclosure
-This code is pretty much entirely AI-generated
+This code is entirely AI-generated.
