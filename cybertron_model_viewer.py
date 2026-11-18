@@ -23,7 +23,7 @@ Controls
   Space                        auto-rotate
   T textures   L lighting   M reflections   V vertex colors   W wireframe
   C invert faces   B background color   G show mask texture   P show proxy models
-  K material colours (game / raw / off)   I material inspector
+  K material colours (game / raw / off)   N show duplicate models   I material inspector
   E / Ctrl+E / Export button   export current model (OBJ + MTL + PNG textures)
   F12 screenshot (screenshots folder)   H or the Help button: key list
 """
@@ -210,6 +210,15 @@ def gl_mat(m):
 # ----------------------------------------------------------------------------
 # Catalogue of everything in the game folder
 # ----------------------------------------------------------------------------
+def _set_label(lbl, text, color=None):
+    """Change a label only if needed: every text change re-lays it out,
+    which is the slow part of redrawing the model list."""
+    if lbl.text != text:
+        lbl.text = text
+    if color is not None and tuple(lbl.color) != color:
+        lbl.color = color
+
+
 class Catalogue:
     def __init__(self):
         self.models = []
@@ -219,6 +228,8 @@ class Catalogue:
         self.files_total = 0
         self.done = False
         self.stop = False
+        self.dups = {}          # model index -> index of the identical copy that is kept
+        self.dups_done = False
 
     def find_texture(self, h, prefer_src=None):
         lst = self.textures.get(h)
@@ -255,6 +266,15 @@ class Catalogue:
                 self.models.extend(mods)
             self.files_done += 1
         self.done = True
+        if not self.stop:
+            try:
+                with self.lock:
+                    models = list(self.models)
+                self.dups = cm.find_duplicates(models, self.find_texture, stop=lambda: self.stop)
+            except Exception as e:
+                print(f"warning: duplicate check failed: {e}", file=sys.stderr)
+                self.dups = {}
+        self.dups_done = True
 
 
 # ----------------------------------------------------------------------------
@@ -641,7 +661,7 @@ class Viewer(pyglet.window.Window):
         self.program = ShaderProgram(Shader(VERT, "vertex"), Shader(FRAG, "fragment"))
 
         self.flags = dict(tex=True, light=True, glow=False, env=True, col=True, wire=False, cull=False,
-                          proxies=False, spin=False, help=False)
+                          proxies=False, spin=False, help=False, nodup=True)
         self.bg = 0
         self.tint_mode = 0         # 0 game colours, 1 raw stored colours, 2 off
         self.vis_rows = []          # indices into cat.models
@@ -719,6 +739,7 @@ class Viewer(pyglet.window.Window):
         threading.Thread(target=self._worker, daemon=True).start()
         pyglet.clock.schedule_interval(self.update, 1 / 60)
         self._last_model_count = -1
+        self._rows_dirty = False
 
     # ------------------------------------------------------------- layout --
     def _clamp_panel(self):
@@ -793,11 +814,14 @@ class Viewer(pyglet.window.Window):
     def _rebuild_visible(self):
         with self.cat.lock:
             models = list(self.cat.models)
+        dups = self.cat.dups if self.cat.dups_done else {}
         terms = self.filter.lower().split()
         cur = self.current_mi            # model on screen (or loading)
         vis = []
         for i, m in enumerate(models):
             if m.is_proxy and not self.flags["proxies"]:
+                continue
+            if self.flags["nodup"] and i in dups:
                 continue
             if terms:
                 hay = f"{m.rel.lower()} {m.name.lower()}"
@@ -814,6 +838,11 @@ class Viewer(pyglet.window.Window):
             self.sel = vis.index(cur)
             if not (self.scroll <= self.sel < self.scroll + self.nrows):
                 self.scroll = max(0, self.sel - self.nrows // 2)
+        elif cur in dups and dups[cur] in vis:
+            # the shown model is now hidden as a duplicate: show the kept copy
+            self.sel = vis.index(dups[cur])
+            self.scroll = max(0, self.sel - self.nrows // 2)
+            self.request_load(dups[cur])
         elif vis:
             # the shown model was filtered out: jump to the top match
             # (loaded after a short pause so typing doesn't trigger a load per key)
@@ -825,6 +854,7 @@ class Viewer(pyglet.window.Window):
         self._refresh_rows()
 
     def _refresh_rows(self):
+        self._rows_dirty = False
         models = self.cat.models
         n = len(self.vis_rows)
         self.scroll = max(0, min(self.scroll, max(0, n - self.nrows)))
@@ -837,10 +867,10 @@ class Viewer(pyglet.window.Window):
                 txt = m.name
                 if stem:
                     txt += f"  ·  {stem}"
-                r.text = txt if len(txt) <= lim else txt[:lim - 1] + "…"
-                r.color = (255, 255, 255, 255) if k == self.sel else (205, 205, 210, 255)
+                _set_label(r, txt if len(txt) <= lim else txt[:lim - 1] + "…",
+                           (255, 255, 255, 255) if k == self.sel else (205, 205, 210, 255))
             else:
-                r.text = ""
+                _set_label(r, "")
         if 0 <= self.sel - self.scroll < self.nrows and self.sel >= 0:
             self.sel_bar.visible = True
             self.sel_bar.y = self.list_top - (self.sel - self.scroll + 1) * ROW_H
@@ -859,18 +889,18 @@ class Viewer(pyglet.window.Window):
         else:
             self.sb_thumb.visible = self.sb_track.visible = False
         total = len(models)
-        self.head.text = f"Models  {n:,}" + (f" of {total:,}" if n != total else "")
+        _set_label(self.head, f"Models  {n:,}" + (f" of {total:,}" if n != total else ""))
         # search box text (placeholder when empty)
         max_chars = max(4, int((self.search_rect[2] - 40) / self.char_w))
         if self.filter:
             t = self.filter if len(self.filter) <= max_chars else "…" + self.filter[-(max_chars - 1):]
             caret = "|" if (self.search_focus and int(time.time() * 2) % 2 == 0) else ""
-            self.search_lbl.text = t + caret
-            self.search_lbl.color = (235, 235, 235, 255)
+            _set_label(self.search_lbl, t + caret, (235, 235, 235, 255))
         else:
-            self.search_lbl.text = ("|" if (self.search_focus and int(time.time() * 2) % 2 == 0) else "") + \
-                ("" if self.search_focus else "Search models…  ( / )")
-            self.search_lbl.color = (235, 235, 235, 255) if self.search_focus else (120, 124, 132, 255)
+            _set_label(self.search_lbl,
+                       ("|" if (self.search_focus and int(time.time() * 2) % 2 == 0) else "") +
+                       ("" if self.search_focus else "Search models…  ( / )"),
+                       (235, 235, 235, 255) if self.search_focus else (120, 124, 132, 255))
         self.search_clear.visible = self.search_clear_bg.visible = bool(self.filter)
 
     def set_filter(self, text):
@@ -1026,7 +1056,7 @@ class Viewer(pyglet.window.Window):
     def update(self, dt):
         while not self.results.empty():
             self._finish_load(*self.results.get())
-        n = len(self.cat.models)
+        n = (len(self.cat.models), self.cat.dups_done)
         if n != self._last_model_count:
             self._last_model_count = n
             self._rebuild_visible()
@@ -1037,6 +1067,10 @@ class Viewer(pyglet.window.Window):
         st = (f"Scanning {self.cat.files_done:,}/{self.cat.files_total:,} files…   "
               if not self.cat.done else
               f"{len(self.cat.models):,} models · {len(self.cat.textures):,} textures indexed   ")
+        if self.cat.done and not self.cat.dups_done:
+            st += "Checking for duplicates…   "
+        elif self.cat.dups and self.flags["nodup"]:
+            st += f"{len(self.cat.dups):,} duplicates hidden (N)   "
         if self.loading is not None:
             st += "Loading…   "
         if self.search_focus:
@@ -1051,6 +1085,8 @@ class Viewer(pyglet.window.Window):
             self._auto_step()
 
     def on_draw(self):
+        if self._rows_dirty:
+            self._refresh_rows()
         bg = BGS[self.bg]
         gl.glClearColor(bg[0], bg[1], bg[2], 1)
         self.clear()
@@ -1216,13 +1252,15 @@ class Viewer(pyglet.window.Window):
             self.frame()
         else:
             names = {key.T: "tex", key.L: "light", key.G: "glow", key.M: "env", key.V: "col", key.W: "wire",
-                     key.C: "cull", key.P: "proxies", key.H: "help"}
+                     key.C: "cull", key.P: "proxies", key.H: "help", key.N: "nodup"}
             if sym in names:
                 f = names[sym]
                 self.flags[f] = not self.flags[f]
-                if f == "proxies":
+                if f in ("proxies", "nodup"):
                     self._rebuild_visible()
-                if f != "help":
+                if f == "nodup":                 # flag means "hide"; shown as "show"
+                    self.flash(f"Show duplicate models: {'off' if self.flags[f] else 'on'}")
+                elif f != "help":
                     self.flash(f"{LABELS[f]}: {'on' if self.flags[f] else 'off'}")
         return pyglet.event.EVENT_HANDLED
 
@@ -1268,7 +1306,7 @@ class Viewer(pyglet.window.Window):
         # y of the thumb's top edge, relative to the top of the track
         rel = (self.list_top - (y + self.thumb_grab)) / max(1, track - th)
         self.scroll = int(round(max(0.0, min(1.0, rel)) * (n - self.nrows)))
-        self._refresh_rows()
+        self._rows_dirty = True          # redrawn once per frame (see on_draw)
 
     def on_mouse_press(self, x, y, button, mods):
         x, y = int(x), int(y)
@@ -1362,7 +1400,7 @@ class Viewer(pyglet.window.Window):
         if x < self.panel_w:
             step = int(round(sy * 3)) or (1 if sy > 0 else -1)
             self.scroll = max(0, self.scroll - step)
-            self._refresh_rows()
+            self._rows_dirty = True
         else:
             self.cam["dist"] *= 0.88 ** sy
 
@@ -1474,7 +1512,8 @@ class Viewer(pyglet.window.Window):
 
 
 LABELS = dict(tex="Textures", light="Lighting", glow="Mask texture", env="Reflections", col="Vertex colors",
-              wire="Wireframe", cull="Invert faces", proxies="Proxy models")
+              wire="Wireframe", cull="Invert faces", proxies="Proxy models",
+              nodup="Show duplicate models")
 
 HELP_TEXT = """T - textures
 L - lighting
@@ -1485,7 +1524,8 @@ C - invert faces
 B - background color
 K - render mode
 G - show mask texture
-P - show proxy models"""
+P - show proxy models
+N - show duplicate models"""
 
 
 def pick_folder(initial):

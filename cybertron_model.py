@@ -45,6 +45,7 @@ Positions are stored in bind pose (model space, Z up). Character UVs are
 1/256 fixed-point positions.
 """
 
+import hashlib
 import os
 import struct
 import sys
@@ -643,6 +644,126 @@ def scan_models(path, rel=None, warn=None):
                     out.append(cur)
                 if cur is not None:
                     cur.chunks.setdefault(c.sub, []).append(c)
+    return out
+
+
+def _texture_refs_and_masked(blob, mask):
+    """Texture references in a material blob: (hash, 0xFFFFxxxx flags) word
+    pairs. Returns (set of hashes, blob with the low 16 bits of every such
+    flags word cleared if `mask`). Those bits differ between otherwise
+    identical copies (e.g. character vs _npc) and are not used for drawing."""
+    n4 = len(blob) // 4 * 4
+    if n4 < 8:
+        return set(), blob
+    a = np.frombuffer(blob[:n4], ">u4").copy()
+    h, fl = a[:-1], a[1:]
+    pair = np.nonzero(((fl >> 16) == 0xFFFF) & (h != 0) & ((h >> 16) != 0xFFFF))[0]
+    refs = {int(x) for x in h[pair]}
+    if mask and len(pair):
+        fi = pair + 1
+        fi = fi[a[fi] != 0xFFFFFFFF]
+        a[fi] &= np.uint32(0xFFFF0000)
+        blob = a.tobytes() + blob[n4:]
+    return refs, blob
+
+
+def _model_digest(model, f, tex_digest):
+    """Content fingerprint of everything the viewer draws for `model`:
+    every model chunk byte for byte (material slot-flag ID bits excepted)
+    plus the pixel data of every texture it references."""
+    h = hashlib.sha1()
+    refs = set()
+    for sub in sorted(model.chunks):
+        for c in model.chunks[sub]:
+            f.seek(c.abs)
+            b = f.read(c.size)
+            if len(b) != c.size:
+                return None
+            if sub in (0x08, 0x12):
+                r, b2 = _texture_refs_and_masked(b, sub == 0x08)
+                refs |= r
+                if sub == 0x08:
+                    b = b2
+            h.update(struct.pack(">BI", sub, c.size))
+            h.update(b)
+    for t in sorted(refs):
+        h.update(struct.pack(">I", t))
+        h.update(tex_digest(t, model.src))
+    return h.digest()
+
+
+def duplicate_rank(model):
+    """Lower = preferred copy to keep: uncompressed files, names without
+    _npc, then shorter paths."""
+    rel = model.rel.lower().replace("\\", "/")
+    base = os.path.basename(rel)
+    return ("compressed" in base or ct.is_compressed_file(model.src),
+            "_npc" in base, len(rel), rel, model.index)
+
+
+def find_duplicates(models, find_texture=None, stop=None):
+    """Find models that are exact copies of another model.
+    Returns {index in models: index of the copy that is kept}.
+
+    Candidates must have identical chunk tables (same parts, same sizes);
+    they are then compared byte for byte (see _model_digest), including the
+    pixel data of the textures they use. `find_texture(hash, prefer_src)`
+    resolves a texture the way the viewer does."""
+    groups = {}
+    for i, m in enumerate(models):
+        if not m.chunks:
+            continue
+        sig = tuple((sub, tuple(c.size for c in m.chunks[sub])) for sub in sorted(m.chunks))
+        groups.setdefault(sig, []).append(i)
+    cands = [g for g in groups.values() if len(g) > 1]
+    if not cands:
+        return {}
+
+    tcache = {}
+
+    def tex_digest(hsh, src):
+        t = find_texture(hsh, src) if find_texture else None
+        if t is None or not t.fmt:
+            return b"-"
+        key = (t.src, t.file_off)
+        if key not in tcache:
+            try:
+                with ct.open_data(t.src) as tf:
+                    tf.seek(t.file_off)
+                    raw = tf.read(t.byte_size())
+                tcache[key] = hashlib.sha1(struct.pack(">HHI", t.width, t.height, t.fmt_id) + raw).digest()
+            except OSError:
+                tcache[key] = b"?" + struct.pack(">I", hsh)
+        return tcache[key]
+
+    by_file = {}
+    for g in cands:
+        for i in g:
+            by_file.setdefault(models[i].src, []).append(i)
+    digest = {}
+    for src, idxs in by_file.items():
+        if stop is not None and stop():
+            return {}
+        try:
+            with ct.open_data(src) as f:
+                for i in idxs:
+                    digest[i] = _model_digest(models[i], f, tex_digest)
+        except (OSError, ValueError):
+            continue
+    out = {}
+    for g in cands:
+        same = {}
+        for i in g:
+            d = digest.get(i)
+            if d is not None:
+                same.setdefault(d, []).append(i)
+        for members in same.values():
+            if len(members) < 2:
+                continue
+            keep = min(members, key=lambda i: duplicate_rank(models[i]))
+            for i in members:
+                if i != keep:
+                    out[i] = keep
     return out
 
 
