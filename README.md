@@ -10,7 +10,7 @@ A viewer/extractor for textures and models from Transformers Cybertron Adventure
 
 `py -m pip install numpy pillow "pyglet>=2.1"`
 
-You also need the game itself in an extracted state. If you already have the game, this can be done using [Dolphin](https://dolphin-emu.org/). Add the folder containing the game to its game list, then right click on the game in the list and select "Properties". Go to the "Filesystem" tab and you should be able to right click the disc icon and select extract.
+You also need the game itself in an extracted state. If you already have the game, this can be done using [Dolphin](https://dolphin-emu.org/). Add the folder containing the game to its list, then right click on the game in the list and select "Properties". Go to the "Filesystem" tab and you should be able to right click the disc icon and select extract.
 
 
 ## Usage
