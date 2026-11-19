@@ -1,12 +1,19 @@
 ## Overview
-A viewer and extractor for textures and models from Transformers Cybertron Adventures for the Nintendo Wii.
+A tool for viewing and extracting assets from Transformers Cybertron Adventures for the Wii. Currently supports:
+
+- Textures
+- Models
+- Animations
+- Audio
 
 <img width="1920" height="1040" alt="preview01" src="https://github.com/user-attachments/assets/dc679e5b-ef20-45fb-82bb-730c6f56fe89" />
 
 
 ## Requirements
 
-[Python](https://www.python.org/) is required, as well as some packages. Paste the following into command prompt to install them:
+[Python](https://www.python.org/) is required. 
+
+After installing Python, you'll need some packages. Paste the following into command prompt to install them:
 
 `py -m pip install numpy pillow "pyglet>=2.1"`
 
@@ -15,9 +22,11 @@ You also need the game itself in an extracted state. If you already have the gam
 
 ## Usage
 
-Model Viewer - `cybertron_model_viewer.py`
+Download the tool by clicking the green "Code" dropdown in the top right, then select "Download ZIP."
 
-Texture Viewer - `cybertron_tex_gui.py`
+Extract the zip, and use the .bat files to launch the tools.
+
+If they don't launch or run slowly, make sure you've installed all required packages.
 
 
 ## Disclosure

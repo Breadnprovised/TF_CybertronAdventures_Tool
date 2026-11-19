@@ -31,7 +31,15 @@ Model chunk group 0xB0 (one model starts at each sub-chunk 0x08):
           meshes; skinned meshes are already in model space. A node whose
           3x3 part is all zero hides its meshes until the game scales them
           in; they are shown at the node's position with unit scale.
-    0x0D  per-mesh bone palette (bone hashes), 0x0C skeleton (hash + 4x4)
+    0x0D  per-mesh bone palette (bone hashes), 0x0C skeleton: 0x44-byte
+          records, bone hash + 4x4 inverse bind matrix (row vectors).
+          Skinned display-list vertices start with GX matrix-index bytes:
+          byte 0 = position matrix = 3 x (palette slot + 1); every vertex is
+          bound to one bone (rigid skinning).
+    group 0x80 sub 3 (same sub-file): bone hierarchy, 0x48-byte records:
+          hash, parent index (-1 = root), 5 x u32, translation xyz, u32,
+          rotation quaternion xyzw, scale xyz (an animation rest pose, not
+          the bind pose - only the hierarchy is used)
           Some characters/vehicles use 0x38-byte records instead: u32 flags,
           f32 x3, RGBA tint, u32, 4 x (hash, flags) - slot0 greyscale diffuse
           + stored colour (not what is shown), slot2 sphere env map.
@@ -241,7 +249,8 @@ class Material:
 
 class Mesh:
     __slots__ = ("pos", "nrm", "uv", "col", "tris", "material", "decl", "node",
-                 "index", "stride", "span", "vb_off", "layout", "hidden")
+                 "index", "stride", "span", "vb_off", "layout", "hidden",
+                 "pnmtx", "palette", "pnmtx_values", "pnmtx_conflicts")
 
     def __init__(self, pos, nrm, uv, col, tris, material, decl):
         self.pos, self.nrm, self.uv, self.col = pos, nrm, uv, col
@@ -251,6 +260,10 @@ class Mesh:
         self.index = self.stride = self.span = self.vb_off = -1
         self.layout = None
         self.hidden = False          # placed by a zero-scale (hidden) node
+        self.pnmtx = None            # per-vertex GX position-matrix index (skinned meshes)
+        self.palette = None          # bone hashes for matrix slots 0, 1, ... (s0d)
+        self.pnmtx_values = None     # every matrix-index value in the display list
+        self.pnmtx_conflicts = 0     # vertices referenced with two different matrices
 
 
 class Model:
@@ -264,6 +277,8 @@ class Model:
         self.chunks = {}          # sub id -> [Chunk]
         self.warnings = []
         self.loaded = False
+        self.bones = []           # [(hash, inverse bind 4x4 row-vector matrix)] from s0c
+        self.hierarchy = []       # [(hash, parent index, local T, R quat, S)] from 0x80/3
 
     @property
     def name(self):
@@ -512,6 +527,19 @@ class Model:
         dls = g[0x13]
         if len(dls) != ndl:
             self.warnings.append(f"{len(dls)} display lists for {ndl} meshes")
+        palettes = [None] * ndl
+        if 0x0C in g:
+            s0c = self._blob(f, 0x0C)
+            self.bones = [(struct.unpack(">I", s0c[k:k + 4])[0],
+                           np.array(struct.unpack(">16f", s0c[k + 4:k + 68]), np.float64).reshape(4, 4))
+                          for k in range(0, len(s0c) - 67, 68)]
+            if len(g.get(0x0D, [])) == ndl:
+                for k in range(ndl):
+                    b = self._blob(f, 0x0D, k)
+                    palettes[k] = list(struct.unpack(f">{len(b) // 4}I", b[:len(b) // 4 * 4]))
+            else:
+                self.warnings.append("bone palettes don't match the meshes; no skinning")
+            self.hierarchy = self._find_hierarchy(f)
         for i in range(min(ndl, len(dls))):
             e = struct.unpack(">9I", s04[i * 0x24:(i + 1) * 0x24])
             span = (offs[i + 1] if i + 1 < ndl else len(vb)) - offs[i]
@@ -525,8 +553,102 @@ class Model:
                 continue
             if mesh is not None:
                 mesh.index, mesh.span, mesh.vb_off = i, span, offs[i]
+                if mesh.pnmtx is not None and palettes[i]:
+                    mesh.palette = palettes[i]
+                else:
+                    mesh.pnmtx = None
                 self._apply_node(mesh, e[5])
                 self.meshes.append(mesh)
+
+    def _find_hierarchy(self, f):
+        """The bone hierarchy (group 0x80 sub 3) in this model's sub-file
+        that covers the most of its bones."""
+        try:
+            subs = ct.find_subfiles(f, ct.data_size(f), self.src)
+            chunks = subs[self.sub_index][1]
+        except Exception:
+            return []
+        want = {h for h, _ in self.bones}
+        best, best_cover = [], 0
+        for c in chunks:
+            if c.is_meta or c.group != 0x80 or c.sub != 3 or c.size % 72:
+                continue
+            b = ct._read_at(f, c.abs, c.size)
+            recs = []
+            for o in range(0, len(b), 72):
+                v = struct.unpack(">II5I3fI4f3f", b[o:o + 72])
+                par = -1 if v[1] == 0xFFFFFFFF else v[1]
+                recs.append((v[0], par, v[7:10], v[11:15], v[15:18]))
+            if any(not (-1 <= r[1] < i) for i, r in enumerate(recs)):
+                continue                       # parents must come first
+            cover = len(want & {r[0] for r in recs})
+            if cover > best_cover:
+                best, best_cover = recs, cover
+        return best
+
+    def skeleton(self):
+        """Joints for export: list of dict(hash, parent, world, ibm), parents
+        first. world = bind-pose 4x4 (row vectors, model space); ibm = the
+        game's inverse bind matrix (None for helper bones that no vertex
+        uses). Hierarchy from group 0x80; bones it doesn't list hang off
+        the root."""
+        if not self.bones:
+            return []
+        ibm = {h: m for h, m in self.bones}
+        # bind poses of bones this model doesn't use, from the other models
+        # in the same sub-file (e.g. the full-detail mesh of a low-detail one)
+        shared = {}
+        try:
+            with ct.open_data(self.src) as f:
+                for other in scan_models(self.src):
+                    if other.sub_index != self.sub_index or 0x0C not in other.chunks:
+                        continue
+                    b = other._blob(f, 0x0C)
+                    for k in range(0, len(b) - 67, 68):
+                        h = struct.unpack(">I", b[k:k + 4])[0]
+                        shared.setdefault(h, np.array(struct.unpack(">16f", b[k + 4:k + 68]),
+                                                      np.float64).reshape(4, 4))
+        except Exception:
+            pass
+        joints, index = [], {}
+
+        def local_from_rec(r):
+            x, y, z, w = r[3]
+            R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)],
+                          [2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)],
+                          [2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)]])
+            L = np.eye(4)
+            L[:3, :3] = np.diag(r[4]) @ R
+            L[3, :3] = r[2]
+            return L
+
+        for r in self.hierarchy:
+            h, par = r[0], r[1]
+            if h in index:
+                continue
+            pj = index.get(self.hierarchy[par][0], -1) if par >= 0 else -1
+            if h in ibm or h in shared:
+                try:
+                    world = np.linalg.inv(ibm.get(h, shared.get(h)))
+                except np.linalg.LinAlgError:
+                    world = np.eye(4)
+            else:
+                world = local_from_rec(r) @ (joints[pj]["world"] if pj >= 0 else np.eye(4))
+            index[h] = len(joints)
+            joints.append(dict(hash=h, parent=pj, world=world, ibm=ibm.get(h)))
+        loose = [h for h, _ in self.bones if h not in index]
+        if loose:
+            root = 0 if joints and joints[0]["parent"] < 0 else -1
+            if root < 0:
+                joints.insert(0, dict(hash=0, parent=-1, world=np.eye(4), ibm=None))
+                for j in joints[1:]:
+                    j["parent"] = j["parent"] + 1 if j["parent"] >= 0 else 0
+                index = {j["hash"]: k for k, j in enumerate(joints)}
+                root = 0
+            for h in loose:
+                index[h] = len(joints)
+                joints.append(dict(hash=h, parent=root, world=np.linalg.inv(ibm[h]), ibm=ibm[h]))
+        return joints
 
     def _decode_mesh(self, vb, off, count, span, dl, decl_hash, mat):
         if count == 0 or len(dl) < 3:
@@ -582,6 +704,7 @@ class Model:
         # triangle strips -> triangles
         vsize = decl["dlpre"] + 2 * decl["nidx"]
         tris = []
+        mtx_parts = []
         p = 0
         n = len(dl)
         while p + 3 <= n:
@@ -596,6 +719,8 @@ class Model:
                 raise ValueError("display list overruns its chunk")
             arr = np.frombuffer(dl, np.uint8, cnt * vsize, p).reshape(cnt, vsize)
             idx = arr[:, decl["dlpre"]:decl["dlpre"] + 2].copy().view(">u2").ravel().astype(np.int64)
+            if decl["dlpre"]:
+                mtx_parts.append((idx, arr[:, 0].copy()))
             p += cnt * vsize
             if prim == 0x98 and cnt >= 3:                     # triangle strip
                 a, b, c = idx[:-2], idx[1:-1], idx[2:]
@@ -624,6 +749,16 @@ class Model:
             raise ValueError("implausible vertex positions")
         mesh = Mesh(pos, nrm, uv, col, t.astype(np.uint32), mat, decl["name"])
         mesh.stride, mesh.layout = st, decl
+        if mtx_parts:
+            vi = np.concatenate([a for a, _ in mtx_parts])
+            mv = np.concatenate([b for _, b in mtx_parts])
+            ok = vi < count
+            pn = np.zeros(count, np.uint8)
+            pn[vi[ok]] = mv[ok]
+            mesh.pnmtx = pn
+            mesh.pnmtx_values = np.unique(mv)
+            pairs = np.unique(vi[ok] * 256 + mv[ok])
+            mesh.pnmtx_conflicts = int(len(pairs) - len(np.unique(vi[ok])))
         return mesh
 
 
@@ -765,6 +900,343 @@ def find_duplicates(models, find_texture=None, stop=None):
                 if i != keep:
                     out[i] = keep
     return out
+
+
+# ----------------------------------------------------------------- glTF ---
+_Y_UP = [-0.7071067811865476, 0.0, 0.0, 0.7071067811865476]   # Z-up game space -> glTF Y-up
+
+
+def _quat_from_matrix(R):
+    """3x3 rotation (column-vector form) -> quaternion [x, y, z, w]."""
+    t = np.trace(R)
+    if t > 0:
+        s_ = np.sqrt(t + 1.0) * 2
+        q = [(R[2, 1] - R[1, 2]) / s_, (R[0, 2] - R[2, 0]) / s_, (R[1, 0] - R[0, 1]) / s_, 0.25 * s_]
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s_ = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        q = [0.25 * s_, (R[0, 1] + R[1, 0]) / s_, (R[0, 2] + R[2, 0]) / s_, (R[2, 1] - R[1, 2]) / s_]
+    elif R[1, 1] > R[2, 2]:
+        s_ = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        q = [(R[0, 1] + R[1, 0]) / s_, 0.25 * s_, (R[1, 2] + R[2, 1]) / s_, (R[0, 2] - R[2, 0]) / s_]
+    else:
+        s_ = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        q = [(R[0, 2] + R[2, 0]) / s_, (R[1, 2] + R[2, 1]) / s_, 0.25 * s_, (R[1, 0] - R[0, 1]) / s_]
+    q = np.array(q, np.float64)
+    q /= np.linalg.norm(q)
+    if q[3] < 0:
+        q = -q
+    return [float(x) for x in q]
+
+
+def _node_transform(local_row):
+    """Row-vector 4x4 -> glTF node fields (TRS when it decomposes cleanly,
+    otherwise a matrix)."""
+    M = local_row.T                      # column-vector form
+    t = M[:3, 3]
+    A = M[:3, :3]
+    sc = np.linalg.norm(A, axis=0)
+    if (sc < 1e-9).any():
+        return {"matrix": [float(x) for x in local_row.ravel()]}
+    if np.linalg.det(A) < 0:
+        sc[0] = -sc[0]
+    R = A / sc
+    if np.abs(R.T @ R - np.eye(3)).max() > 1e-4:
+        return {"matrix": [float(x) for x in local_row.ravel()]}   # sheared
+    out = {}
+    if np.abs(t).max() > 1e-9:
+        out["translation"] = [float(x) for x in t]
+    q = _quat_from_matrix(R)
+    if abs(q[3] - 1) > 1e-9:
+        out["rotation"] = q
+    if np.abs(sc - 1).max() > 1e-6:
+        out["scale"] = [float(x) for x in sc]
+    return out
+
+
+def _decompose_frames(L):
+    """(F, 4, 4) row-vector local matrices -> translations (F,3),
+    quaternions (F,4, xyzw, sign-continuous) and scales (F,3)."""
+    M = np.transpose(L, (0, 2, 1))            # column-vector form
+    t = M[:, :3, 3]
+    A = M[:, :3, :3]
+    sc = np.linalg.norm(A, axis=1)            # column norms
+    sc = np.where(sc < 1e-9, 1e-9, sc)
+    neg = np.linalg.det(A) < 0
+    sc[neg, 0] *= -1
+    R = A / sc[:, None, :]
+    q = np.array([_quat_from_matrix(r) for r in R])
+    for k in range(1, len(q)):
+        if np.dot(q[k], q[k - 1]) < 0:
+            q[k] = -q[k]
+    return t, q, sc
+
+
+class _GlbBuilder:
+    def __init__(self):
+        self.bin = bytearray()
+        self.views, self.accessors = [], []
+
+    def view(self, data, target=None):
+        while len(self.bin) % 4:
+            self.bin.append(0)
+        v = {"buffer": 0, "byteOffset": len(self.bin), "byteLength": len(data)}
+        if target:
+            v["target"] = target
+        self.bin += data
+        self.views.append(v)
+        return len(self.views) - 1
+
+    def accessor(self, arr, kind, target=None, minmax=False, normalized=False):
+        arr = np.ascontiguousarray(arr)
+        ctype = {np.dtype(np.float32): 5126, np.dtype(np.uint32): 5125,
+                 np.dtype(np.uint16): 5123, np.dtype(np.uint8): 5121}[arr.dtype]
+        a = {"bufferView": self.view(arr.astype(arr.dtype.newbyteorder("<")).tobytes(), target),
+             "componentType": ctype, "count": int(arr.shape[0]), "type": kind}
+        if normalized:
+            a["normalized"] = True
+        if minmax:
+            a["min"] = [float(x) for x in np.atleast_1d(arr.min(axis=0))]
+            a["max"] = [float(x) for x in np.atleast_1d(arr.max(axis=0))]
+        self.accessors.append(a)
+        return len(self.accessors) - 1
+
+
+def export_glb(model, path, images=None, embed=False, skeleton=True, clips=None, progress=None):
+    """Write the model as a binary glTF (.glb) and, for characters/vehicles,
+    the skeleton and vertex weights.
+
+    images: texture key -> PIL image, keys as from Material (texture hash,
+    or ("baked", diffuse, colour map) for light/decal materials).
+    Textures are written as PNG files next to the .glb and referenced by
+    relative path (embed=True packs them into the .glb instead).
+    Game space is Z-up; a root node rotates it to glTF's Y-up. Skinning is
+    rigid (one bone per vertex, weight 1), as in the game.
+
+    skeleton=False writes the meshes alone, in the bind pose.
+    clips: [(ClipInfo, kind)] from cybertron_anim (kind "same"/"shared") -
+    each is baked as a glTF animation on the joints, which Blender imports
+    as an action. Needs the skeleton. progress(done, total) is called per
+    clip."""
+    import io
+    import json
+    model.load()
+    images = images or {}
+    B = _GlbBuilder()
+    gl = {"asset": {"version": "2.0", "generator": "Cybertron Adventures tools"},
+          "scene": 0, "scenes": [{"name": model.name, "nodes": [0]}],
+          "nodes": [{"name": model.name, "rotation": _Y_UP, "children": []}],
+          "meshes": [], "materials": [], "buffers": [{"byteLength": 0}]}
+    nodes = gl["nodes"]
+    used_ext = set()
+
+    # ---- textures
+    tex_index, img_list, tex_list = {}, [], []
+    out_dir = os.path.dirname(os.path.abspath(path))
+    role_of = {}
+    for mat in model.materials or []:
+        for _slot, h, role in mat.slot_roles():
+            role_of.setdefault(h, role)
+    written = []
+
+    def texture(key):
+        if key is None or key not in images:
+            return None
+        if key not in tex_index:
+            im = images[key]
+            if isinstance(key, tuple):
+                name = f"{key[1]:08x}x{key[2]:08x}_light"
+            else:
+                name = f"{key:08x}_{role_of.get(key, 'texture')}"
+            if embed:
+                buf = io.BytesIO()
+                im.save(buf, "PNG")
+                img_list.append({"bufferView": B.view(buf.getvalue()), "mimeType": "image/png",
+                                 "name": name})
+            else:
+                im.save(os.path.join(out_dir, name + ".png"))
+                written.append(name + ".png")
+                img_list.append({"uri": name + ".png", "name": name})
+            tex_list.append({"sampler": 0, "source": len(img_list) - 1})
+            tex_index[key] = len(tex_list) - 1
+        return tex_index[key]
+
+    def has_alpha(key):
+        im = images.get(key)
+        if im is None or im.mode not in ("RGBA", "LA", "P"):
+            return False
+        return im.convert("RGBA").getchannel("A").getextrema()[0] < 128
+
+    # ---- materials
+    for i, mat in enumerate(model.materials or []):
+        m = {"name": f"mat{i}", "doubleSided": True,
+             "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 0.8}}
+        tint = list(mat.game_tint) if mat.kind != "colour" else list(mat.tint)
+        pbr = m["pbrMetallicRoughness"]
+        pbr["baseColorFactor"] = [float(x) for x in tint] + [1.0]
+        baked_key = ("baked", mat.diffuse, mat.colour_map) if mat.colour_map else None
+        main = baked_key if baked_key in images else mat.diffuse
+        ti = texture(main)
+        if ti is not None:
+            pbr["baseColorTexture"] = {"index": ti}
+            if has_alpha(main):
+                m["alphaMode"] = "MASK"
+                m["alphaCutoff"] = 0.5
+        if baked_key in images:
+            # light/decal material: drawn unlit in the game
+            m["extensions"] = {"KHR_materials_unlit": {}}
+            used_ext.add("KHR_materials_unlit")
+            pbr["baseColorFactor"] = [1.0, 1.0, 1.0, 1.0]
+        extras = {}
+        for slot, h, role in mat.slot_roles():
+            if role == "diffuse" and h == mat.diffuse:
+                continue
+            k = texture(h)
+            if k is not None:
+                extras[f"{role}Texture"] = {"index": k, "slot": slot, "hash": f"{h:08x}"}
+        if extras:
+            m["extras"] = extras
+        gl["materials"].append(m)
+
+    # ---- skeleton
+    joints = model.skeleton() if skeleton and any(me.palette for me in model.meshes) else []
+    skin_index = None
+    joint_of = {}
+    if joints:
+        first = len(nodes)
+        for k, j in enumerate(joints):
+            pw = joints[j["parent"]]["world"] if j["parent"] >= 0 else np.eye(4)
+            local = j["world"] @ np.linalg.inv(pw)
+            nd = {"name": f"bone_{j['hash']:08x}" if j["hash"] else "root"}
+            nd.update(_node_transform(local))
+            nodes.append(nd)
+            joint_of[j["hash"]] = k
+        for k, j in enumerate(joints):
+            par = nodes[first + j["parent"]] if j["parent"] >= 0 else nodes[0]
+            par.setdefault("children", []).append(first + k)
+        ibms = np.stack([(j["ibm"] if j["ibm"] is not None else np.linalg.inv(j["world"])).ravel()
+                         for j in joints]).astype(np.float32)
+        gl["skins"] = [{"name": f"{model.name} skeleton", "joints": list(range(first, first + len(joints))),
+                        "skeleton": first, "inverseBindMatrices": B.accessor(ibms, "MAT4")}]
+        skin_index = 0
+
+    # ---- meshes
+    for k, me in enumerate(model.meshes):
+        n = len(me.pos)
+        attrs = {"POSITION": B.accessor(me.pos.astype(np.float32), "VEC3", 34962, minmax=True)}
+        if me.nrm is not None:
+            nr = me.nrm.astype(np.float32)
+            ln = np.linalg.norm(nr, axis=1, keepdims=True)
+            nr = np.where(ln > 1e-6, nr / np.maximum(ln, 1e-6), np.array([0, 0, 1], np.float32))
+            attrs["NORMAL"] = B.accessor(nr.astype(np.float32), "VEC3", 34962)
+        if me.uv is not None:
+            attrs["TEXCOORD_0"] = B.accessor(me.uv.astype(np.float32), "VEC2", 34962)
+        if me.col is not None:
+            attrs["COLOR_0"] = B.accessor(np.clip(me.col, 0, 1).astype(np.float32), "VEC3", 34962)
+        skinned = skin_index is not None and me.palette and me.pnmtx is not None
+        if skinned:
+            slot = me.pnmtx.astype(np.int64) // 3 - 1
+            lut = np.array([joint_of.get(h, 0) for h in me.palette] + [0], np.int64)
+            slot = np.where((slot >= 0) & (slot < len(me.palette)), slot, len(me.palette))
+            jt = np.zeros((n, 4), np.uint16 if len(joints) > 255 else np.uint8)
+            jt[:, 0] = lut[slot]
+            wt = np.zeros((n, 4), np.float32)
+            wt[:, 0] = 1.0
+            attrs["JOINTS_0"] = B.accessor(jt, "VEC4", 34962)
+            attrs["WEIGHTS_0"] = B.accessor(wt, "VEC4", 34962)
+        prim = {"attributes": attrs, "mode": 4,
+                "indices": B.accessor(me.tris.astype(np.uint32).ravel(), "SCALAR", 34963)}
+        if 0 <= me.material < len(gl["materials"]):
+            prim["material"] = me.material
+        gl["meshes"].append({"name": f"mesh{k:03d}", "primitives": [prim]})
+        nd = {"name": f"mesh{k:03d}" + ("_hidden" if me.hidden else ""), "mesh": len(gl["meshes"]) - 1}
+        if skinned:
+            nd["skin"] = skin_index
+            nodes.append(nd)
+            gl["scenes"][0]["nodes"].append(len(nodes) - 1)     # skinned meshes at the scene root
+        else:
+            nodes.append(nd)
+            nodes[0]["children"].append(len(nodes) - 1)
+
+    # ---- animations (Blender: one action per clip)
+    anim_names, anim_failed = [], []
+    if joints and clips:
+        import cybertron_anim as ca
+        first = gl["skins"][0]["joints"][0]
+        seen = {}
+        for ci, (info, kind) in enumerate(clips):
+            if progress:
+                progress(ci, len(clips))
+            try:
+                L = ca.bake_joint_locals(model, joints, info, kind)
+            except Exception as ex:          # noqa: BLE001
+                L = None
+                print(f"animation {info.name}: {ex}")
+            if L is None:
+                anim_failed.append(info.name)
+                continue
+            F = L.shape[0]
+            times = np.arange(F, dtype=np.float32) / np.float32(ca.FPS)
+            t_all = B.accessor(times, "SCALAR", minmax=True)
+            t_one = None
+            samplers, channels = [], []
+
+            def channel(node, path, vals, kind_):
+                nonlocal t_one
+                if np.abs(vals - vals[0]).max() < 1e-6:       # constant: one key
+                    if t_one is None:
+                        t_one = B.accessor(times[:1], "SCALAR", minmax=True)
+                    inp, vals = t_one, vals[:1]
+                else:
+                    inp = t_all
+                samplers.append({"input": inp, "output": B.accessor(vals.astype(np.float32), kind_),
+                                 "interpolation": "LINEAR"})
+                channels.append({"sampler": len(samplers) - 1, "target": {"node": node, "path": path}})
+
+            for k in range(len(joints)):
+                t, q, sc = _decompose_frames(L[:, k])
+                channel(first + k, "translation", t, "VEC3")
+                channel(first + k, "rotation", q, "VEC4")
+                channel(first + k, "scale", sc, "VEC3")
+            name = info.name or f"clip{ci}"
+            if name in seen:
+                stem = os.path.splitext(os.path.basename(info.rel.replace("\\", "/")))[0]
+                name = f"{name} ({stem})"
+                while name in seen:
+                    name += "+"
+            seen[name] = 1
+            gl.setdefault("animations", []).append({"name": name, "samplers": samplers, "channels": channels})
+            anim_names.append(name)
+        if progress:
+            progress(len(clips), len(clips))
+        if anim_names:       # animated nodes must be TRS, not a matrix (glTF rule)
+            for k in range(len(joints)):
+                nd = nodes[first + k]
+                if "matrix" in nd:
+                    t, q, sc = _decompose_frames(np.array(nd.pop("matrix")).reshape(1, 4, 4))
+                    nd.update(translation=[float(x) for x in t[0]], rotation=[float(x) for x in q[0]],
+                              scale=[float(x) for x in sc[0]])
+
+    if img_list:
+        gl["images"], gl["textures"] = img_list, tex_list
+        gl["samplers"] = [{"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}]
+    if not gl["materials"]:
+        del gl["materials"]
+    if used_ext:
+        gl["extensionsUsed"] = sorted(used_ext)
+    if not nodes[0]["children"]:
+        del nodes[0]["children"]
+    while len(B.bin) % 4:
+        B.bin.append(0)
+    gl["buffers"][0]["byteLength"] = len(B.bin)
+    gl["bufferViews"], gl["accessors"] = B.views, B.accessors
+    js = json.dumps(gl, separators=(",", ":")).encode()
+    js += b" " * (-len(js) % 4)
+    with open(path, "wb") as fo:
+        fo.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(js) + 8 + len(B.bin)))
+        fo.write(struct.pack("<II", len(js), 0x4E4F534A) + js)
+        fo.write(struct.pack("<II", len(B.bin), 0x004E4942) + bytes(B.bin))
+    return dict(joints=len(joints), meshes=len(model.meshes), textures=len(img_list), files=written,
+                animations=len(anim_names), animations_failed=anim_failed)
 
 
 def export_obj(model, path, textures=None):

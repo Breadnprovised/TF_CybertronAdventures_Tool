@@ -78,7 +78,7 @@ GX = {
     "CMPR": (4, 8, 8),
 }
 # format field at header+0x20 -> GX format (observed in the game's files)
-FORMAT_IDS = {1: "RGB5A3", 2: "CMPR"}
+FORMAT_IDS = {1: "RGB5A3", 2: "CMPR", 3: "RGBA8", 7: "IA8"}
 # fallback by bits-per-pixel for an unknown format id
 BPP_GUESS = {4: "CMPR", 8: "I8", 16: "RGB5A3", 32: "RGBA8"}
 
@@ -407,7 +407,8 @@ def read_dict(path, n):
     """Read a .dict companion file: a list of sub-files inside the .data.
     Header: u32 hash, u16 version(0x0301), u16 0; then 0x4C-byte entries:
     +0x04 u32 offset of the sub-file in the .data, +0x0C u32 chunk-table
-    size, +0x18/+0x20/+0x28/... (u32 size, u32 align) data section sizes.
+    size, +0x10/+0x18/+0x20/... (u32 size, u32 align) data section sizes,
+    section 0 first (empty in most files, but not in e.g. unlockables).
     The chunk table follows the data sections. Returns [(table_pos, table_size)]."""
     try:
         x = open(path, "rb").read()
@@ -419,7 +420,7 @@ def read_dict(path, n):
     for r in range(8, len(x) - 0x4B, 0x4C):
         v = struct.unpack(">19I", x[r:r + 0x4C])
         off, tsize = v[1], v[3]
-        data = sum(v[i] for i in range(6, 19, 2))
+        data = sum(v[i] for i in range(4, 19, 2))
         tpos = off + data
         if tsize == 0 or tpos + tsize > n:
             return None
@@ -529,7 +530,9 @@ class Texture:
         self.pos = pos
         self.hash = struct.unpack(">I", hdr[0:4])[0]
         self.width, self.height = struct.unpack(">HH", hdr[0x0E:0x12])
-        self.tag = hdr[0x14:0x17].rstrip(b"\0\t\x01\x02").decode("latin1", "replace")
+        tag = hdr[0x14:0x17].rstrip(b"\0\t\x01\x02")
+        # usually letters ("VP", "USH"); some formats store raw bytes -> show hex
+        self.tag = tag.decode("ascii") if all(0x20 < c < 0x7F for c in tag) else tag.hex(" ")
         self.mips = max(hdr[0x18], 1)
         self.fmt_id, self.data_off = struct.unpack(">II", hdr[0x20:0x28])
         self.fmt = FORMAT_IDS.get(self.fmt_id)
@@ -601,7 +604,7 @@ def _finish_group(texs, data_base, data_len, warn):
                 t.fmt, t.guessed = f, True
                 break
         warn(f"texture {t.name()}: unknown format id {t.fmt_id} "
-             f"(tag {t.tag!r}); guessed {t.fmt or 'nothing'}")
+             f"(tag {t.tag}); guessed {t.fmt or 'nothing'}")
 
 
 def _scan_whole_file(f, n, src, warn):

@@ -44,7 +44,7 @@ COLUMNS = [  # id, heading, width, anchor
     ("size", "Size", 90, "center"),
     ("fmt", "Format", 70, "center"),
     ("mips", "Mips", 45, "center"),
-    ("tag", "Tag", 50, "center"),
+    ("tag", "Tag", 70, "center"),
     ("bytes", "Bytes", 80, "e"),
     ("offset", "Offset", 90, "e"),
 ]

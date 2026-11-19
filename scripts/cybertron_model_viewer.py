@@ -24,7 +24,8 @@ Controls
   T textures   L lighting   M reflections   V vertex colors   W wireframe
   C invert faces   B background color   G show mask texture   P show proxy models
   K material colours (game / raw / off)   N show duplicate models   I material inspector
-  E / Ctrl+E / Export button   export current model (OBJ + MTL + PNG textures)
+  A animations panel ([ and ] step one frame)
+  E / Ctrl+E / Export button   export current model (.glb + PNG textures, skeleton + weights)
   F12 screenshot (screenshots folder)   H or the Help button: key list
 """
 
@@ -38,6 +39,8 @@ import time
 import ctypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# exports/screenshots go next to the launchers when the scripts live in "scripts"
+BASE = os.path.dirname(HERE) if os.path.basename(HERE).lower() == "scripts" else HERE
 sys.path.insert(0, HERE)
 
 import numpy as np
@@ -53,6 +56,7 @@ except ImportError:
 
 import cybertron_tex as ct
 import cybertron_model as cm
+import cybertron_anim as ca
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".cybertron_model_viewer.json")
 PANEL_W = 330          # default side-panel width (resizable, remembered)
@@ -63,27 +67,39 @@ ROW_H = 20
 FONT = 10
 BGS = [(0.16, 0.17, 0.19), (0.45, 0.47, 0.5), (0.02, 0.02, 0.02), (0.85, 0.86, 0.88)]
 
+MAX_BONES = 128
+
 VERT = """#version 330 core
 in vec3 position;
 in vec3 normal;
 in vec2 uv;
 in vec3 color;
+in float bone;
 uniform mat4 mvp;
 uniform mat4 model;
 uniform mat4 view;
+uniform mat4 bones[128];
+uniform int skinned;
 out vec3 v_pos;
 out vec3 v_vnrm;
 out vec3 v_nrm;
 out vec2 v_uv;
 out vec3 v_col;
 void main() {
-    vec4 wp = model * vec4(position, 1.0);
+    vec4 p = vec4(position, 1.0);
+    vec3 nn = normal;
+    if (skinned == 1) {                 // rigid skinning: one bone per vertex
+        mat4 b = bones[int(bone + 0.5)];
+        p = b * p;
+        nn = mat3(b) * normal;
+    }
+    vec4 wp = model * p;
     v_pos = wp.xyz;
-    v_nrm = mat3(model) * normal;
+    v_nrm = mat3(model) * nn;
     v_vnrm = mat3(view) * v_nrm;
     v_uv = uv;
     v_col = color;
-    gl_Position = mvp * vec4(position, 1.0);
+    gl_Position = mvp * p;
 }
 """
 
@@ -161,7 +177,7 @@ void main() {
 def output_dir(kind):
     """Folder for exports / screenshots: next to this script if writable,
     otherwise in the user's home folder."""
-    for base in (HERE, os.path.join(os.path.expanduser("~"), "CybertronTools")):
+    for base in (BASE, os.path.join(os.path.expanduser("~"), "CybertronTools")):
         d = os.path.join(base, kind)
         try:
             os.makedirs(d, exist_ok=True)
@@ -230,6 +246,7 @@ class Catalogue:
         self.stop = False
         self.dups = {}          # model index -> index of the identical copy that is kept
         self.dups_done = False
+        self.clips = []         # cybertron_anim.ClipInfo for every animation found
 
     def find_texture(self, h, prefer_src=None):
         lst = self.textures.get(h)
@@ -248,7 +265,7 @@ class Catalogue:
         for r, dirs, names in os.walk(root):
             dirs.sort()
             files += [os.path.join(r, n) for n in sorted(names)
-                      if not n.lower().endswith((".dict", ".png", ".obj", ".mtl"))]
+                      if not n.lower().endswith((".dict", ".png", ".obj", ".mtl", ".glb"))]
         self.files_total = len(files)
         for path in files:
             if self.stop:
@@ -260,10 +277,15 @@ class Catalogue:
             except Exception as e:
                 print(f"warning: {rel}: {e}", file=sys.stderr)
                 texs, mods = [], []
+            try:
+                clips = ca.list_clips(path, rel)
+            except Exception:
+                clips = []
             with self.lock:
                 for t in texs:
                     self.textures.setdefault(t.hash, []).append(t)
                 self.models.extend(mods)
+                self.clips.extend(clips)
             self.files_done += 1
         self.done = True
         if not self.stop:
@@ -289,12 +311,23 @@ class GpuModel:
         self.arrays = tex_arrays          # kept for the material panel thumbnails
         for h, arr in tex_arrays.items():
             self.textures[h] = upload_texture(arr)
+        node_of = {r[0]: i for i, r in enumerate(model.hierarchy)} if model.hierarchy else {}
+        self.skinnable = bool(node_of) and len(node_of) <= MAX_BONES
         for mesh in model.meshes:
             n = len(mesh.pos)
             idx = mesh.tris.ravel().tolist()
             if not idx:
                 continue
+            bone = np.zeros(n, np.float32)
+            skin = False
+            if self.skinnable and mesh.palette and mesh.pnmtx is not None:
+                slot = mesh.pnmtx.astype(np.int64) // 3 - 1
+                lut = np.array([node_of.get(h, -1) for h in mesh.palette] + [-1])
+                b = lut[np.where((slot >= 0) & (slot < len(mesh.palette)), slot, len(mesh.palette))]
+                skin = bool((b >= 0).any())
+                bone = np.maximum(b, 0).astype(np.float32)
             data = dict(
+                bone=("f", bone.tolist()),
                 position=("f", mesh.pos.ravel().tolist()),
                 normal=("f", (mesh.nrm if mesh.nrm is not None else np.zeros((n, 3))).ravel().tolist()),
                 uv=("f", (mesh.uv if mesh.uv is not None else np.zeros((n, 2))).ravel().tolist()),
@@ -311,7 +344,7 @@ class GpuModel:
             colmap = get(mat.colour_map) if mat else None
             mcols = mat.mask_colours if mat else ((1.0, 1.0, 1.0),) * 3
             unlit = bool(mat and mat.is_light)
-            self.parts.append((vl, mesh, diff, spec, env, glow, tints, colmap, unlit, mcols))
+            self.parts.append((vl, mesh, diff, spec, env, glow, tints, colmap, unlit, mcols, skin))
         lo, hi = model.bounds()
         if not (np.isfinite(lo).all() and np.isfinite(hi).all()):
             lo, hi = np.zeros(3), np.ones(3)
@@ -395,6 +428,8 @@ class MaterialPanel:
     # ------------------------------------------------------------------
     def toggle(self):
         self.visible = not self.visible
+        if self.visible:
+            self.win.close_panels(self)
         if not self.visible:
             self.highlight = None
             self.preview = None
@@ -643,6 +678,556 @@ class MaterialPanel:
         return True
 
 
+class AnimPanel:
+    """Side panel listing the animations that fit the current model, with
+    playback controls. The pose is applied on the GPU (rigid skinning)."""
+    W = 410
+    ROW = 20
+    CTRL_H = 112
+
+    def __init__(self, win):
+        self.win = win
+        self.visible = False
+        self.gpu = None
+        self.items = []              # [(ClipInfo, kind)]
+        self.cur = None              # index into items
+        self.animator = None
+        self.time = 0.0              # seconds
+        self.playing = False
+        self.loop = True
+        self.speed = 1.0
+        self.additive = False
+        self.layer = None            # (local pose, orientation, clip name) the next clip is layered on
+        self.scroll = 0
+        self.batch = pyglet.graphics.Batch()
+        self.g0, self.g1, self.g2 = (pyglet.graphics.Group(order=i) for i in range(3))
+        self.objs, self.hits = [], []
+        self.dyn = []                # timeline objects updated every frame
+        self.dragging = False
+        self.sb_drag = None          # grab offset inside the thumb while dragging the scroll bar
+        self._sb = None              # (list_top, avail, total, thumb_h, thumb_y) of the list scroll bar
+        self._last_rebuild_frame = None
+
+    @property
+    def rect(self):
+        w = self.win
+        x0 = max(w.panel_w + 260, w.width - self.W)
+        return x0, 28, w.width - x0, w.height - 46 - 28
+
+    # ------------------------------------------------------------------
+    def toggle(self):
+        self.visible = not self.visible
+        if self.visible:
+            self.win.close_panels(self)
+        self.rebuild()
+        if self.visible:
+            n = len(self.items)
+            self.win.flash(f"Animations: {n} fit this model - click one to play" if n else
+                           "Animations: none found for this model in the scanned folder")
+        else:
+            self.win.flash("Animations closed (model shown in its bind pose)")
+
+    def set_model(self, gpu):
+        self.gpu = gpu
+        self.cur = None
+        self.animator = None
+        self.layer = None
+        self.playing = False
+        self.time = 0.0
+        self.scroll = 0
+        self.items = []
+        if gpu is not None and gpu.skinnable:
+            m = gpu.model
+            with self.win.cat.lock:
+                clips = list(self.win.cat.clips)
+            for info in clips:
+                kind = ca.match(m, info)
+                if kind:
+                    self.items.append((info, kind))
+            src = m.src
+            self.items.sort(key=lambda it: (it[0].src != src, it[1] != "same", it[0].rel.lower(), it[0].sub_index, it[0].order))
+        self.rebuild()
+
+    def refresh_list(self):
+        """New clips were scanned: rebuild the list for the current model."""
+        cur = self.items[self.cur][0] if self.cur is not None else None
+        t, playing = self.time, self.playing
+        anim = self.animator
+        self.set_model(self.gpu)
+        if cur is not None:
+            for i, (info, _k) in enumerate(self.items):
+                if info is cur:
+                    self.cur, self.animator, self.time, self.playing = i, anim, t, playing
+        self.rebuild()
+
+    def on_escape(self):
+        return False
+
+    def layout(self):
+        self.rebuild()
+
+    # ------------------------------------------------------------------
+    @property
+    def clip(self):
+        return self.animator.clip if self.animator else None
+
+    def frames(self):
+        c = self.clip
+        return max(c.frames, 1) if c else 1
+
+    def frame(self):
+        return min(self.time * ca.FPS, self.frames() - 1)
+
+    def matrices(self):
+        """Skinning matrices for the current frame, or None (bind pose)."""
+        if not self.visible or self.animator is None or self.animator.clip is None:
+            return None
+        return self.animator.pose(self.frame())
+
+    def play(self, i):
+        info, kind = self.items[i]
+        try:
+            clip = ca.load_clip(info)
+        except Exception as ex:          # noqa: BLE001
+            self.win.flash(f"Could not read {info.name}: {ex}", error=True)
+            return
+        if clip is None:
+            self.win.flash(f"Could not read {info.name}", error=True)
+            return
+        if self.animator is None:
+            self.animator = ca.Animator(self.gpu.model)
+        A = self.animator
+        A.set_base(None)
+        A.set_clip(clip, info, kind)
+        self.cur, self.time, self.playing = i, 0.0, True
+        self._apply_layer()
+        how = "this model's own rig" if kind == "same" else "shared rig, matched by bone"
+        self.win.flash(f"{info.name}: {clip.frames} frames ({clip.frames / ca.FPS:.1f} s) from {info.rel} - {how}")
+        self.rebuild()
+
+    def _apply_layer(self):
+        A = self.animator
+        if A is None or A.clip is None:
+            return
+        if self.additive:
+            # additive clips are always layered on the bind pose
+            A.set_base(A.bind_locals())
+            A.G = np.eye(4)
+        else:
+            A.set_base(None)
+            A.G = A._centre_from(A._orientation())
+
+    def stop(self):
+        self.cur, self.playing, self.time = None, False, 0.0
+        self.layer = None
+        if self.animator:
+            self.animator.set_base(None)
+            self.animator.set_clip(None, None, None)
+            self.animator.clip = None
+        self.rebuild()
+
+    def tick(self, dt):
+        if not (self.visible and self.playing and self.clip):
+            return
+        length = self.frames() / ca.FPS
+        self.time += dt * self.speed
+        if self.time >= length - 1e-6:
+            if self.loop:
+                self.time %= max(length, 1e-6)
+            else:
+                self.time = (self.frames() - 1) / ca.FPS
+                self.playing = False
+                self.rebuild()
+        self._update_timeline()
+
+    def step(self, n):
+        if not self.clip:
+            return
+        self.playing = False
+        f = int(round(self.frame())) + n
+        self.time = (f % self.frames()) / ca.FPS
+        self.rebuild()
+
+    # ------------------------------------------------------------------
+    def _timeline_rect(self):
+        x0, y0, pw, ph = self.rect
+        top = y0 + ph
+        return x0 + 16, top - 84, pw - 32, 14
+
+    def _update_timeline(self):
+        for o in self.dyn:
+            o.delete()
+        self.dyn = []
+        if not self.visible:
+            return
+        tx, ty, tw, th = self._timeline_rect()
+        B = self.batch
+        n = self.frames()
+        f = self.frame()
+        frac = f / max(n - 1, 1) if self.clip else 0
+        self.dyn.append(pyglet.shapes.Rectangle(tx, ty, max(1, int(tw * frac)), th, color=(70, 120, 190, 255), batch=B, group=self.g1))
+        self.dyn.append(pyglet.shapes.Rectangle(tx + int(tw * frac) - 2, ty - 3, 4, th + 6, color=(235, 235, 235, 255), batch=B, group=self.g2))
+        if self.clip:
+            txt = f"frame {int(f) + 1} / {n}   ·   {self.time:.2f} / {n / ca.FPS:.2f} s"
+            if self.additive:
+                txt += "   ·   additive on bind pose"
+        else:
+            txt = "bind pose - pick an animation below"
+        self.dyn.append(pyglet.text.Label(txt, x=tx, y=ty - 18, font_size=FONT - 1, color=(190, 195, 205, 255),
+                                          batch=B, group=self.g2))
+
+    def rebuild(self):
+        for o in self.objs + self.dyn:
+            o.delete()
+        self.objs, self.hits, self.dyn = [], [], []
+        if not self.visible:
+            return
+        B, G0, G1, G2 = self.batch, self.g0, self.g1, self.g2
+        x0, y0, pw, ph = self.rect
+        top = y0 + ph
+        add = self.objs.append
+        add(pyglet.shapes.Rectangle(x0, y0, pw, ph, color=(22, 24, 28, 238), batch=B, group=G0))
+        add(pyglet.shapes.Rectangle(x0, y0, 2, ph, color=(60, 64, 72, 255), batch=B, group=G1))
+        chars = int((pw - 40) / self.win.char_w)
+        gpu = self.gpu
+        if gpu is None:
+            add(pyglet.text.Label("No model loaded", x=x0 + 14, y=top - 24, font_size=FONT,
+                                  color=(190, 190, 190, 255), batch=B, group=G2))
+            return
+        cur = self.items[self.cur][0] if self.cur is not None else None
+        title = f"Animations ({len(self.items)})" + (f"  ·  {cur.name}" if cur else "")
+        add(pyglet.text.Label(title[:chars], x=x0 + 14, y=top - 20, font_size=FONT + 1, weight="bold",
+                              color=(235, 235, 235, 255), batch=B, group=G2))
+        # transport buttons
+        bx, by = x0 + 14, top - 54
+        for name, text, w_ in (("play", "Pause" if self.playing else "Play", 64), ("prev", "<", 30), ("next", ">", 30),
+                               ("loop", "Loop", 50),
+                               ("speed", f"{self.speed:g}x", 44), ("add", "Additive", 74), ("bind", "Bind pose", 78)):
+            on = (name == "loop" and self.loop) or (name == "play" and self.playing) or (name == "add" and self.additive)
+            add(pyglet.shapes.Rectangle(bx, by, w_, 22, color=(52, 80, 120, 255) if on else (48, 52, 60, 255), batch=B, group=G1))
+            add(pyglet.text.Label(text, x=bx + w_ // 2, y=by + 11, anchor_x="center", anchor_y="center",
+                                  font_size=FONT - 1, color=(235, 235, 235, 255), batch=B, group=G2))
+            self.hits.append((bx, by, w_, 22, name, None))
+            bx += w_ + 5
+        tx, ty, tw, th = self._timeline_rect()
+        add(pyglet.shapes.Rectangle(tx, ty, tw, th, color=(45, 48, 55, 255), batch=B, group=G0))
+        self.hits.append((tx, ty - 6, tw, th + 12, "timeline", None))
+        self._update_timeline()
+        # list
+        list_top = top - self.CTRL_H
+        add(pyglet.shapes.Rectangle(x0 + 8, list_top + 4, pw - 16, 1, color=(60, 64, 72, 255), batch=B, group=G1))
+        if not gpu.skinnable:
+            msg = ["This model has no skeleton."] if not gpu.model.hierarchy else ["Skeleton too large to animate here."]
+            for k, line in enumerate(msg):
+                add(pyglet.text.Label(line, x=x0 + 14, y=list_top - 20 - k * 16, font_size=FONT - 1,
+                                      color=(190, 190, 190, 255), batch=B, group=G2))
+            return
+        if not self.items:
+            msg = ["No animations for this model in the scanned folder.",
+                   "Character animations are in art/characters",
+                   "(*_shared, *_player and the character's own file)",
+                   "and art/NIS (transformations, cutscenes)."]
+            for k, line in enumerate(msg):
+                add(pyglet.text.Label(line[:chars + 4], x=x0 + 14, y=list_top - 20 - k * 16, font_size=FONT - 1,
+                                      color=(190, 190, 190, 255), batch=B, group=G2))
+            return
+        rows = []
+        last = None
+        for i, (info, kind) in enumerate(self.items):
+            grp = (info.rel, info.sub_index)
+            if grp != last:
+                name = info.rel.replace("\\", "/").rsplit("/", 1)[-1]
+                label = ("own rig  ·  " if kind == "same" else "shared rig  ·  ") + name
+                rows.append(("head", label, None))
+                last = grp
+            rows.append(("clip", info, i))
+        total = len(rows) * self.ROW + 10
+        avail = list_top - y0
+        self.scroll = max(0, min(self.scroll, max(0, total - avail)))
+        y = list_top + self.scroll
+        for kind_, a, i in rows:
+            y -= self.ROW
+            if y > list_top - self.ROW + 2 or y < y0:
+                continue
+            if kind_ == "head":
+                add(pyglet.text.Label(a[:int(chars * 0.92)], x=x0 + 12, y=y + 5, font_size=FONT - 1, weight="bold",
+                                      color=(150, 175, 210, 255), batch=B, group=G2))
+                continue
+            sel = i == self.cur
+            if sel:
+                add(pyglet.shapes.Rectangle(x0 + 8, y, pw - 16, self.ROW, color=(52, 101, 164, 255), batch=B, group=G1))
+            secs = f"{a.frames} f · {a.seconds:.1f} s"
+            add(pyglet.text.Label(a.name[:max(8, chars - len(secs) - 2)], x=x0 + 22, y=y + 5, font_size=FONT,
+                                  color=(255, 255, 255, 255) if sel else (215, 215, 215, 255), batch=B, group=G2))
+            add(pyglet.text.Label(secs, x=x0 + pw - 18, y=y + 5, anchor_x="right", font_size=FONT - 1,
+                                  color=(160, 165, 175, 255), batch=B, group=G2))
+            self.hits.append((x0 + 8, y, pw - 16, self.ROW, "clip", i))
+        self._sb = None
+        if total > avail:
+            th_ = max(30, int(avail * avail / total))
+            ty_ = list_top - th_ - int((avail - th_) * self.scroll / max(1, total - avail))
+            sx = x0 + pw - 10
+            add(pyglet.shapes.Rectangle(sx, y0, 8, avail, color=(36, 39, 45, 255), batch=B, group=G1))
+            col = (150, 156, 168, 255) if self.sb_drag is not None else (110, 115, 125, 255)
+            add(pyglet.shapes.Rectangle(sx + 1, ty_, 6, th_, color=col, batch=B, group=G2))
+            self._sb = (list_top, avail, total, th_, ty_)
+            # checked before the clip rows, which reach under the bar
+            self.hits.insert(0, (sx - 4, y0, 14, avail, "sbar", None))
+
+    # ------------------------------------------------------------------
+    def draw(self, scale):
+        if not self.visible:
+            return
+        x0, y0, pw, ph = self.rect
+        gl.glEnable(gl.GL_SCISSOR_TEST)
+        gl.glScissor(int(x0 * scale), int(y0 * scale), int(pw * scale) + 1, int(ph * scale) + 1)
+        self.batch.draw()
+        gl.glDisable(gl.GL_SCISSOR_TEST)
+
+    def _scrub(self, x):
+        tx, ty, tw, th = self._timeline_rect()
+        if not self.clip:
+            return
+        frac = max(0.0, min(1.0, (x - tx) / max(tw, 1)))
+        self.time = frac * (self.frames() - 1) / ca.FPS
+        self.playing = False
+        self._update_timeline()
+
+    def on_press(self, x, y, button):
+        if not self.visible:
+            return False
+        x0, y0, pw, ph = self.rect
+        if not (x0 <= x <= x0 + pw and y0 <= y <= y0 + ph):
+            return False
+        if button != mouse.LEFT:
+            return True
+        for hx, hy, hw, hh, act, arg in self.hits:
+            if hx <= x <= hx + hw and hy <= y <= hy + hh:
+                if act == "clip":
+                    self.play(arg)
+                elif act == "play":
+                    if self.clip:
+                        if not self.playing and self.frame() >= self.frames() - 1 and not self.loop:
+                            self.time = 0.0
+                        self.playing = not self.playing
+                    elif self.items:
+                        self.play(self.cur if self.cur is not None else 0)
+                        return True
+                elif act == "prev":
+                    self.step(-1)
+                    return True
+                elif act == "next":
+                    self.step(1)
+                    return True
+                elif act == "loop":
+                    self.loop = not self.loop
+                elif act == "add":
+                    self.additive = not self.additive
+                    self._apply_layer()
+                    if self.additive:
+                        self.win.flash("Additive: clips are layered on the bind pose - only the bones they "
+                                       "animate move, by how much they change from the clip's first frame")
+                    else:
+                        self.win.flash("Additive off: clips play as full poses")
+                elif act == "speed":
+                    sp = [0.25, 0.5, 1.0, 2.0]
+                    self.speed = sp[(sp.index(self.speed) + 1) % len(sp)] if self.speed in sp else 1.0
+                elif act == "bind":
+                    self.stop()
+                    return True
+                elif act == "sbar":
+                    if self._sb:
+                        _lt, _av, _tot, th_, ty_ = self._sb
+                        # grab the thumb where it was clicked; a click on the track centres it there
+                        self.sb_drag = (y - ty_) if ty_ <= y <= ty_ + th_ else th_ / 2
+                        self._scroll_to_thumb(y)
+                    return True
+                elif act == "timeline":
+                    self.dragging = True
+                    self._scrub(x)
+                    return True
+                self.rebuild()
+                return True
+        return True
+
+    def _scroll_to_thumb(self, y):
+        """Scroll so the thumb's grabbed point sits at mouse height y."""
+        list_top, avail, total, th_, _ty = self._sb
+        travel = max(1, avail - th_)
+        frac = (list_top - th_ - (y - self.sb_drag)) / travel
+        self.scroll = int(round(max(0.0, min(1.0, frac)) * (total - avail)))
+        self.rebuild()
+
+    def on_drag(self, x, y):
+        if self.sb_drag is not None and self._sb:
+            self._scroll_to_thumb(y)
+            return True
+        if self.dragging:
+            self._scrub(x)
+            return True
+        return False
+
+    def on_release(self):
+        if self.sb_drag is not None:
+            self.sb_drag = None
+            self.rebuild()
+            return True
+        if self.dragging:
+            self.dragging = False
+            self.rebuild()
+            return True
+        return False
+
+    def on_scroll(self, x, y, sy):
+        if not self.visible:
+            return False
+        x0, y0, pw, ph = self.rect
+        if not (x0 <= x <= x0 + pw and y0 <= y <= y0 + ph):
+            return False
+        self.scroll = max(0, self.scroll - int(sy * 40))
+        self.rebuild()
+        return True
+
+
+class SettingsPanel:
+    """Side panel with export options (saved between sessions)."""
+    W = 410
+    OPTIONS = (("export_skeleton", "Export Skeleton", True,
+                "Bones and vertex weights (characters, vehicles). Off: meshes only, in the bind pose."),
+               ("export_animations", "Export Animations", False,
+                "Every animation in the Animations list, one glTF animation each - Blender imports "
+                "them as actions. Needs the skeleton."))
+
+    def __init__(self, win):
+        self.win = win
+        self.visible = False
+        self.batch = pyglet.graphics.Batch()
+        self.g0, self.g1, self.g2 = (pyglet.graphics.Group(order=i) for i in range(3))
+        self.objs, self.hits = [], []
+        self.values = {k: bool(win.cfg.get(k, d)) for k, _t, d, _h in self.OPTIONS}
+
+    def get(self, k):
+        return self.values[k]
+
+    @property
+    def rect(self):
+        w = self.win
+        x0 = max(w.panel_w + 260, w.width - self.W)
+        return x0, 28, w.width - x0, w.height - 46 - 28
+
+    def toggle(self):
+        self.visible = not self.visible
+        if self.visible:
+            self.win.close_panels(self)
+        self.rebuild()
+        self.win.flash("Settings open" if self.visible else "Settings closed")
+
+    def layout(self):
+        self.rebuild()
+
+    def set_model(self, gpu):
+        self.rebuild()
+
+    def _save(self):
+        self.win.cfg.update(self.values)
+        try:
+            cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
+            cfg.update(self.values)
+            json.dump(cfg, open(CONFIG, "w"))
+        except Exception:
+            pass
+
+    def _wrap(self, text, chars):
+        lines, cur = [], ""
+        for word in text.split():
+            if cur and len(cur) + 1 + len(word) > chars:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = f"{cur} {word}".strip()
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def rebuild(self):
+        for o in self.objs:
+            o.delete()
+        self.objs, self.hits = [], []
+        if not self.visible:
+            return
+        B, G0, G1, G2 = self.batch, self.g0, self.g1, self.g2
+        x0, y0, pw, ph = self.rect
+        top = y0 + ph
+        add = self.objs.append
+        add(pyglet.shapes.Rectangle(x0, y0, pw, ph, color=(22, 24, 28, 238), batch=B, group=G0))
+        add(pyglet.shapes.Rectangle(x0, y0, 2, ph, color=(60, 64, 72, 255), batch=B, group=G1))
+        add(pyglet.text.Label("Settings", x=x0 + 14, y=top - 20, font_size=FONT + 1, weight="bold",
+                              color=(235, 235, 235, 255), batch=B, group=G2))
+        add(pyglet.text.Label("Export (E)", x=x0 + 14, y=top - 48, font_size=FONT - 1, weight="bold",
+                              color=(150, 175, 210, 255), batch=B, group=G2))
+        chars = max(20, int((pw - 60) / (self.win.char_w * 0.92)))
+        y = top - 62
+        gpu = self.win.gpu
+        for k, title, _d, help_ in self.OPTIONS:
+            on = self.values[k]
+            enabled = not (k == "export_animations" and not self.values["export_skeleton"])
+            y -= 26
+            box = (52, 101, 164, 255) if on and enabled else ((70, 74, 82, 255) if enabled else (45, 48, 54, 255))
+            add(pyglet.shapes.Rectangle(x0 + 16, y + 3, 16, 16, color=(90, 96, 108, 255), batch=B, group=G1))
+            add(pyglet.shapes.Rectangle(x0 + 17, y + 4, 14, 14, color=box, batch=B, group=G1))
+            if on:
+                add(pyglet.shapes.Rectangle(x0 + 20, y + 7, 8, 8, batch=B, group=G2,
+                                            color=(235, 240, 250, 255) if enabled else (120, 122, 128, 255)))
+            add(pyglet.text.Label(title, x=x0 + 42, y=y + 6, font_size=FONT,
+                                  color=(235, 235, 235, 255) if enabled else (130, 132, 138, 255), batch=B, group=G2))
+            self.hits.append((x0 + 8, y, pw - 16, 24, k))
+            note = help_
+            if k == "export_animations":
+                if not enabled:
+                    note = "Turn on Export Skeleton to export animations."
+                elif gpu is not None:
+                    n = len(self.win.animpanel.items) if gpu.skinnable else 0
+                    note += f" ({n} for the current model.)" if n else " (None for the current model.)"
+            for line in self._wrap(note, chars):
+                y -= 16
+                add(pyglet.text.Label(line, x=x0 + 42, y=y + 4, font_size=FONT - 2,
+                                      color=(160, 165, 175, 255), batch=B, group=G2))
+            y -= 8
+
+    def draw(self, scale):
+        if not self.visible:
+            return
+        x0, y0, pw, ph = self.rect
+        gl.glEnable(gl.GL_SCISSOR_TEST)
+        gl.glScissor(int(x0 * scale), int(y0 * scale), int(pw * scale) + 1, int(ph * scale) + 1)
+        self.batch.draw()
+        gl.glDisable(gl.GL_SCISSOR_TEST)
+
+    def on_press(self, x, y, button):
+        if not self.visible:
+            return False
+        x0, y0, pw, ph = self.rect
+        if not (x0 <= x <= x0 + pw and y0 <= y <= y0 + ph):
+            return False
+        if button == mouse.LEFT:
+            for hx, hy, hw, hh, k in self.hits:
+                if hx <= x <= hx + hw and hy <= y <= hy + hh:
+                    if k == "export_animations" and not self.values["export_skeleton"]:
+                        self.win.flash("Export Animations needs Export Skeleton", error=True)
+                        return True
+                    self.values[k] = not self.values[k]
+                    self._save()
+                    self.rebuild()
+                    break
+        return True
+
+    def on_scroll(self, x, y, sy):
+        if not self.visible:
+            return False
+        x0, y0, pw, ph = self.rect
+        return x0 <= x <= x0 + pw and y0 <= y <= y0 + ph
+
+
 # ----------------------------------------------------------------------------
 # Viewer window
 # ----------------------------------------------------------------------------
@@ -720,7 +1305,9 @@ class Viewer(pyglet.window.Window):
         self.help_lbl = pyglet.text.Label(HELP_TEXT, x=0, y=0, font_size=FONT + 1, multiline=True,
                                           width=260, color=(240, 240, 240, 255), anchor_y="top", batch=B, group=F)
         self.buttons = []          # (name, rect, label)
-        for name, text in (("materials", "Materials  (I)"), ("export", "Export OBJ  (E)"), ("help", "Help  (H)")):
+        for name, text in (("animations", "Animations  (A)"), ("materials", "Materials  (I)"),
+                           ("export", "Export  (E)"), ("settings", "Settings  (O)"),
+                           ("help", "Help  (H)")):
             r = pyglet.shapes.Rectangle(0, 0, 10, 26, color=(50, 54, 62, 235), batch=B, group=M)
             lb = pyglet.text.Label(text, x=0, y=0, font_size=FONT, anchor_x="center", anchor_y="center",
                                    color=(235, 235, 235, 255), batch=B, group=F)
@@ -729,6 +1316,11 @@ class Viewer(pyglet.window.Window):
         self.char_w = max(probe.content_width / 41.0, 4.0)
         probe.delete()
         self.matpanel = MaterialPanel(self)
+        self.animpanel = AnimPanel(self)
+        self.setpanel = SettingsPanel(self)
+        self.export_job = None     # background export: dict(name, done, total, result, error)
+        self.bones_loc = gl.glGetUniformLocation(self.program.id, b"bones")
+        self._clip_count = 0
         self.cur_resize = self.get_system_mouse_cursor(self.CURSOR_SIZE_LEFT_RIGHT)
         self.cur_text = self.get_system_mouse_cursor(self.CURSOR_TEXT)
         self._layout()
@@ -790,6 +1382,10 @@ class Viewer(pyglet.window.Window):
             bx -= 8
         if hasattr(self, "matpanel"):
             self.matpanel.layout()
+        if hasattr(self, "animpanel"):
+            self.animpanel.layout()
+        if hasattr(self, "setpanel"):
+            self.setpanel.layout()
         # right side
         self.info.x, self.info.y = pw + 14, h - 10
         self.status_lbl.x = pw + 14
@@ -799,12 +1395,25 @@ class Viewer(pyglet.window.Window):
     def _place_help(self):
         """Help box under the top-right buttons (left of the material panel if open)."""
         h = self.height
-        right = self.matpanel.rect[0] - 10 if getattr(self, "matpanel", None) and self.matpanel.visible else self.width - 10
+        right = self._view_right() - 10
         hh = int(self.help_lbl.content_height) + 28
         hw = int(self.help_lbl.content_width) + 40
         self.help_bg.width, self.help_bg.height = hw, hh
         self.help_bg.x, self.help_bg.y = right - hw, h - 46 - hh
         self.help_lbl.x, self.help_lbl.y = right - hw + 20, h - 46 - 14
+
+    def _view_right(self):
+        for pnl in (getattr(self, "matpanel", None), getattr(self, "animpanel", None),
+                    getattr(self, "setpanel", None)):
+            if pnl is not None and pnl.visible:
+                return pnl.rect[0]
+        return self.width
+
+    def close_panels(self, keep):
+        """Side panels share the right edge: opening one closes the others."""
+        for pnl in (self.matpanel, self.animpanel, getattr(self, "setpanel", None)):
+            if pnl is not None and pnl is not keep and pnl.visible:
+                pnl.toggle()
 
     def on_resize(self, w, h):
         super().on_resize(w, h)
@@ -1005,6 +1614,7 @@ class Viewer(pyglet.window.Window):
             self.gpu = None
         if err:
             self.matpanel.set_model(None)
+            self.animpanel.set_model(None)
             self.flash(f"Could not load {m.name}: {err}")
             self._update_info(m, missing, err)
             return
@@ -1015,6 +1625,8 @@ class Viewer(pyglet.window.Window):
             self.prefetch = [self.vis_rows[r] for r in (self.sel + 1, self.sel - 1, self.sel + 2)
                              if 0 <= r < len(self.vis_rows) and not self.cat.models[self.vis_rows[r]].loaded]
         self.matpanel.set_model(self.gpu)
+        self.animpanel.set_model(self.gpu)
+        self.setpanel.set_model(self.gpu)
         self.frame()
         self._update_info(m, missing)
 
@@ -1062,6 +1674,14 @@ class Viewer(pyglet.window.Window):
             self._rebuild_visible()
         if self.flags["spin"]:
             self.cam["yaw"] += 20 * dt
+        self.animpanel.tick(dt)
+        self._check_export()
+        nclips = len(self.cat.clips)
+        if nclips != self._clip_count and (self.cat.done or nclips - self._clip_count > 200):
+            self._clip_count = nclips
+            if self.gpu:
+                self.animpanel.refresh_list()
+                self.setpanel.rebuild()
         if self.search_focus:
             self._refresh_rows()          # caret blink
         st = (f"Scanning {self.cat.files_done:,}/{self.cat.files_total:,} files…   "
@@ -1092,7 +1712,7 @@ class Viewer(pyglet.window.Window):
         self.clear()
         fbw, fbh = self.get_framebuffer_size()
         sx = fbw / max(self.width, 1)
-        right = self.matpanel.rect[0] if self.matpanel.visible else self.width
+        right = self._view_right()
         vx, vw = int(self.panel_w * sx), max(1, int(right * sx) - int(self.panel_w * sx))
         if self.gpu:
             gl.glViewport(vx, 0, vw, fbh)
@@ -1128,9 +1748,14 @@ class Viewer(pyglet.window.Window):
             p["env_tex"] = 3
             p["colour_tex"] = 4
             hl = self.matpanel.highlight
-            for vl, mesh, diff, spec, env, glow, tints, colmap, unlit, mcols in self.gpu.parts:
+            posed = self.animpanel.matrices()
+            if posed is not None:
+                arr = (gl.GLfloat * posed.size)(*posed.astype(np.float32).ravel())
+                gl.glUniformMatrix4fv(self.bones_loc, len(posed), gl.GL_FALSE, arr)
+            for vl, mesh, diff, spec, env, glow, tints, colmap, unlit, mcols, skin in self.gpu.parts:
                 if hl is not None and mesh.material != hl:
                     continue                  # material selected: show only its faces
+                p["skinned"] = int(skin and posed is not None)
                 p["mask_r"], p["mask_g"], p["mask_b"] = (tuple(float(v) for v in c) for c in mcols)
                 game = self.tint_mode == 0 and self.flags["tex"]
                 p["has_colmap"] = int(bool(colmap) and game and mesh.uv is not None)
@@ -1171,6 +1796,8 @@ class Viewer(pyglet.window.Window):
             self._place_help()
         self.ui.draw()
         self.matpanel.draw(fbw / max(self.width, 1))
+        self.animpanel.draw(fbw / max(self.width, 1))
+        self.setpanel.draw(fbw / max(self.width, 1))
 
     # ------------------------------------------------------------- input --
     def flash(self, text, error=False):
@@ -1241,6 +1868,12 @@ class Viewer(pyglet.window.Window):
             self.bg = (self.bg + 1) % len(BGS)
         elif sym == key.I:
             self.matpanel.toggle()
+        elif sym == key.A:
+            self.animpanel.toggle()
+        elif sym == key.O:
+            self.setpanel.toggle()
+        elif sym in (key.BRACKETLEFT, key.BRACKETRIGHT) and self.animpanel.visible:
+            self.animpanel.step(-1 if sym == key.BRACKETLEFT else 1)
         elif sym == key.K:
             self.tint_mode = (self.tint_mode + 1) % 3
             self.flash("Material colours: " + ("game", "raw (as stored)", "off")[self.tint_mode])
@@ -1313,6 +1946,10 @@ class Viewer(pyglet.window.Window):
         self.drag = None
         if self.matpanel.on_press(x, y, button):
             return
+        if self.animpanel.on_press(x, y, button):
+            return
+        if self.setpanel.on_press(x, y, button):
+            return
         if self._on_divider(x) and button == mouse.LEFT:
             self.drag = "resize"
             self._layout()
@@ -1347,8 +1984,12 @@ class Viewer(pyglet.window.Window):
                 pyglet.clock.schedule_once(lambda dt, r=r: setattr(r, "color", (50, 54, 62, 235)), 0.15)
                 if name == "materials":
                     self.matpanel.toggle()
+                elif name == "animations":
+                    self.animpanel.toggle()
                 elif name == "export":
                     self.export_current()
+                elif name == "settings":
+                    self.setpanel.toggle()
                 elif name == "help":
                     self.flags["help"] = not self.flags["help"]
                 return
@@ -1359,6 +2000,8 @@ class Viewer(pyglet.window.Window):
         x, y = int(x), int(y)
         was = self.drag
         self.drag = None
+        if self.animpanel.on_release():
+            return
         if was == "resize":
             self.cfg["panel_width"] = self.panel_w
             try:
@@ -1374,6 +2017,8 @@ class Viewer(pyglet.window.Window):
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, mods):
         x, y = int(x), int(y)
+        if self.animpanel.on_drag(x, y):
+            return
         if self.drag == "resize":
             self.panel_w = x
             self._layout()
@@ -1396,6 +2041,10 @@ class Viewer(pyglet.window.Window):
     def on_mouse_scroll(self, x, y, sx, sy):
         x, y = int(x), int(y)
         if self.matpanel.on_scroll(x, y, sy):
+            return
+        if self.animpanel.on_scroll(x, y, sy):
+            return
+        if self.setpanel.on_scroll(x, y, sy):
             return
         if x < self.panel_w:
             step = int(round(sy * 3)) or (1 if sy > 0 else -1)
@@ -1420,34 +2069,35 @@ class Viewer(pyglet.window.Window):
         return path
 
     def export_current(self):
+        if self.export_job is not None:
+            self.flash("An export is still running…")
+            return
         if not self.gpu:
             self.flash("Nothing to export - select a model first", error=True)
             return
         m = self.gpu.model
         name = m.name.replace(" #", "_").replace(" ", "_")
         try:
-            out = os.path.join(output_dir("model_exports"), name)
+            out = os.path.join(output_dir("model_exports"), name)     # .glb + its PNG textures
             os.makedirs(out, exist_ok=True)
-            texmap, missing = {}, set()
+            images, missing = {}, set()
             for mat in m.materials:
                 for _slot, h, role in mat.slot_roles():   # every texture slot
-                    if h in texmap or h in missing:
+                    if h in images or h in missing:
                         continue
                     t = self.cat.find_texture(h, m.src)
                     if t is None:
                         missing.add(h)
                         continue
-                    fn = f"{h:08x}_{role}.png"
                     try:
-                        t.image(0).save(os.path.join(out, fn))
-                        texmap[h] = fn
+                        images[h] = t.image(0)
                     except Exception:
                         missing.add(h)
-            # light/decal materials: bake diffuse mask x colour map into one PNG
+            # light/decal materials: bake diffuse mask x colour map into one texture
             nbaked = 0
             for mat in m.materials:
                 d, c = mat.diffuse, mat.colour_map
-                if not c or ("baked", d, c) in texmap:
+                if not c or ("baked", d, c) in images:
                     continue
                 td, tc = self.cat.find_texture(d, m.src), self.cat.find_texture(c, m.src)
                 if td is None or tc is None:
@@ -1460,24 +2110,66 @@ class Viewer(pyglet.window.Window):
                     rgb = np.asarray(a.convert("RGB"), np.float32) / 255 * col
                     baked = Image.fromarray(np.clip(rgb * 255 + 0.5, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
                     baked.putalpha(a.getchannel("A"))
-                    fn = f"{d:08x}x{c:08x}_light.png"
-                    baked.save(os.path.join(out, fn))
-                    texmap[("baked", d, c)] = fn
+                    images[("baked", d, c)] = baked
                     nbaked += 1
                 except Exception:
                     pass
-            obj = os.path.join(out, name + ".obj")
-            cm.export_obj(m, obj, texmap)
-            with open(os.path.join(out, "materials.txt"), "w", encoding="utf-8") as fh:
+            glb = os.path.join(out, name + ".glb")
+            with open(os.path.join(out, name + "_materials.txt"), "w", encoding="utf-8") as fh:
                 fh.write(m.material_report(lambda h: self.cat.find_texture(h, m.src)) + "\n")
         except Exception as e:
             self.flash(f"Export failed: {e}", error=True)
             print("export failed:", e, file=sys.stderr)
             return
-        self.flash(f"Exported {name}.obj + {sum(1 for k in texmap if not isinstance(k, tuple))} texture(s)"
-                   + (f" + {nbaked} baked light texture(s)" if nbaked else "") + f" to {os.path.abspath(out)}"
-                   + (f"  ({len(missing)} referenced texture(s) not in the game folder)" if missing else ""))
-        print("exported:", os.path.abspath(obj))
+        skel = self.setpanel.get("export_skeleton")
+        clips = []
+        if skel and self.setpanel.get("export_animations") and self.gpu.skinnable:
+            clips = list(self.animpanel.items)
+        job = dict(name=name, out=out, glb=glb, missing=len(missing), done=0, total=len(clips),
+                   result=None, error=None, finished=False)
+        self.export_job = job
+
+        def progress(done, total):
+            job["done"], job["total"] = done, total
+
+        def run():
+            try:
+                job["result"] = cm.export_glb(m, glb, images, skeleton=skel, clips=clips, progress=progress)
+            except Exception as e:          # noqa: BLE001
+                job["error"] = e
+            job["finished"] = True
+
+        if clips:
+            self.flash(f"Exporting {name}.glb with {len(clips)} animations…")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _check_export(self):
+        job = self.export_job
+        if job is None:
+            return
+        if not job["finished"]:
+            if job["total"]:
+                self.flash(f"Exporting {job['name']}.glb - animation {min(job['done'] + 1, job['total'])}"
+                           f"/{job['total']}…")
+            return
+        self.export_job = None
+        if job["error"] is not None:
+            self.flash(f"Export failed: {job['error']}", error=True)
+            print("export failed:", job["error"], file=sys.stderr)
+            return
+        info = job["result"]
+        parts = [f"{info['meshes']} meshes", f"{info['textures']} texture PNGs"]
+        if info["joints"]:
+            parts.append(f"{info['joints']} bones")
+        if info.get("animations"):
+            parts.append(f"{info['animations']} animations")
+        msg = f"Exported {job['name']}.glb ({', '.join(parts)}) to {os.path.abspath(job['out'])}"
+        if info.get("animations_failed"):
+            msg += f"  ({len(info['animations_failed'])} animation(s) could not be read)"
+        if job["missing"]:
+            msg += f"  ({job['missing']} referenced texture(s) not in the game folder)"
+        self.flash(msg)
+        print("exported:", os.path.abspath(job["glb"]))
 
     # ------------------------------------------------------------- testing --
     def _auto_step(self):
@@ -1525,7 +2217,9 @@ B - background color
 K - render mode
 G - show mask texture
 P - show proxy models
-N - show duplicate models"""
+N - show duplicate models
+A - animations
+O - settings (export options)"""
 
 
 def pick_folder(initial):
