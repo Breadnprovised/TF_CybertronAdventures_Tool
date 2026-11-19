@@ -6,8 +6,7 @@ A tool for viewing and extracting assets from Transformers Cybertron Adventures 
 - Animations
 - Audio
 
-<img width="1920" height="1040" alt="preview01" src="https://github.com/user-attachments/assets/dc679e5b-ef20-45fb-82bb-730c6f56fe89" />
-
+<img width="1920" height="1040" alt="Untitled" src="https://github.com/user-attachments/assets/2f2336d8-b0ee-4195-9e5c-af7e61136159" />
 
 ## Requirements
 
